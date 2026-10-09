@@ -1115,7 +1115,7 @@
     </div>
     <div id="alertItems"></div>
     <div class="alert-foot">
-      <button class="btn btn-secondary" onclick="snoozeAlerts()">Remind me in 30 minutes</button>
+      <button class="btn btn-secondary" onclick="closeAlertPopup()">Dismiss</button>
       <button class="btn btn-primary" onclick="openAlertsTab()">Open Alerts list</button>
     </div>
   </div>
@@ -1148,7 +1148,6 @@ function periodFor(offset) { // 0 = current, -1 = previous (server), fallback to
   return { start: start, end: addDays(start, PAY_PERIOD_DAYS - 1) };
 }
 const ALERT_POLL_MS = 2 * 60 * 1000;
-const ALERT_SNOOZE_MS = 30 * 60 * 1000;
 const COMPANY_NAME = 'MP Holdings, LLC';
 // Company printed on a time card, by the employee's DEFAULT venue (edit here if a venue is added)
 const COMPANY_BY_VENUE = { 'VEN-SV': 'MP Holdings, LLC', 'VEN-C88': 'Mariana Entertainment, LLC' };
@@ -1919,8 +1918,24 @@ async function voidPunch(btn, r) {
 function startAlertPolling(pre) { stopAlertPolling(); checkAlerts(false, pre); alertTimer = setInterval(function () { checkAlerts(false); }, ALERT_POLL_MS); }
 function stopAlertPolling() { if (alertTimer) clearInterval(alertTimer); alertTimer = null; }
 
-function getSnoozes() { try { return JSON.parse(localStorage.getItem('alert_snooze') || '{}'); } catch (e) { return {}; } }
-function setSnoozes(s) { try { localStorage.setItem('alert_snooze', JSON.stringify(s)); } catch (e) {} }
+// ALERTPOP (V2, 2026-10-09): each alert pops up at most ONCE per admin login session. The record of which alerts
+// were shown lives in this tab's sessionStorage, tied to the login token, so a refresh keeps it, a new login starts
+// fresh, and other tabs / admin accounts are independent. Closing the pop-up never changes anything on the server;
+// the badge, Alerts list and Dashboard keep updating as before.
+let ALERT_SEEN_MEM = null; // fallback when sessionStorage is unavailable: once per page load
+function alertKey(a) { return a.type + ':' + a.rawId; }
+function getSeenAlerts() {
+  let s = null;
+  try { s = JSON.parse(sessionStorage.getItem('alert_seen') || 'null'); } catch (e) {}
+  if (!s || s.token !== sessionToken) s = ALERT_SEEN_MEM;
+  return s && s.token === sessionToken ? s.ids : {};
+}
+function markAlertsSeen(list) {
+  const s = { token: sessionToken, ids: getSeenAlerts() };
+  list.forEach(function (a) { s.ids[alertKey(a)] = 1; });
+  ALERT_SEEN_MEM = s;
+  try { sessionStorage.setItem('alert_seen', JSON.stringify(s)); } catch (e) {}
+}
 
 async function checkAlerts(fromUser, pre) {
   if (!sessionToken) return;
@@ -1931,12 +1946,15 @@ async function checkAlerts(fromUser, pre) {
   document.getElementById('alertSub').textContent = 'Still clocked in past their hours + break + 5 min, clock-outs with no clock-in, breaks not ended, and shifts with no clock-out after ' + result.data.alertHours + ' hours (last 30 days). Checked every 2 minutes.';
   setAlertTable(result);
 
-  // Pop up for alerts that are not snoozed
-  const snooze = getSnoozes(), now = Date.now();
-  Object.keys(snooze).forEach(function (k) { if (snooze[k] < now) delete snooze[k]; });
-  setSnoozes(snooze);
-  const due = lastAlerts.filter(function (a) { return !snooze[a.rawId]; });
-  if (due.length) showAlertPopup(due);
+  // ALERTPOP: pop up only for alerts not yet shown in this login session. If the pop-up is still open, it keeps the
+  // alerts it already shows (while they are unresolved) and adds the new ones; it closes when none are left.
+  const seen = getSeenAlerts();
+  const fresh = lastAlerts.filter(function (a) { return !seen[alertKey(a)]; });
+  const overlay = document.getElementById('alertOverlay');
+  const open = overlay.classList.contains('open') ? (overlay.dataset.ids || '').split(',') : [];
+  const keep = lastAlerts.filter(function (a) { return open.indexOf(alertKey(a)) !== -1; });
+  const show = keep.concat(fresh);
+  if (show.length) { showAlertPopup(show); markAlertsSeen(fresh); }
   else closeAlertPopup();
 }
 
@@ -1979,7 +1997,7 @@ function showAlertPopup(list) {
   const overlay = document.getElementById('alertOverlay');
   const wasOpen = overlay.classList.contains('open');
   const prevIds = overlay.dataset.ids || '';
-  const ids = list.map(function (a) { return a.rawId; }).join(',');
+  const ids = list.map(alertKey).join(','); // ALERTPOP: type + id, as in the once-per-session record
   document.getElementById('alertTitle').textContent = list.length === 1
     ? (list[0].type === 'EMP_REPORT' ? 'Employee reported a problem' : list[0].type === 'LONG_BREAK' ? 'Break not ended' : list[0].type === 'OVERDUE_OUT' ? 'Possible missed clock-out'
       : list[0].type === 'PIN_LOCKED' ? 'Employee locked out'
@@ -2003,12 +2021,7 @@ function showAlertPopup(list) {
   if (isNew) playAlarm(list);
 }
 function closeAlertPopup() { const o = document.getElementById('alertOverlay'); o.classList.remove('open'); o.dataset.ids = ''; }
-function snoozeAlerts() {
-  const s = getSnoozes(), until = Date.now() + ALERT_SNOOZE_MS;
-  lastAlerts.forEach(function (a) { s[a.rawId] = until; });
-  setSnoozes(s); closeAlertPopup();
-}
-function openAlertsTab() { closeAlertPopup(); snoozeAlerts(); showTab('alerts'); }
+function openAlertsTab() { closeAlertPopup(); showTab('alerts'); }
 
 function toast(text) {
   let t = document.getElementById('toast');
@@ -2087,8 +2100,9 @@ async function lockAction(btn, a, what) {
 }
 
 function fixAlert(a) {
-  // Snooze while the admin is fixing it, then take them to the Clock tab ready to add the missing punch.
-  const s = getSnoozes(); s[a.rawId] = Date.now() + ALERT_SNOOZE_MS; setSnoozes(s);
+  // No pop-up for this alert while the admin is fixing it (ALERTPOP: seen for this session), then take them to the
+  // Clock tab ready to add the missing punch.
+  markAlertsSeen([a]);
   closeAlertPopup();
   showTab('clock');
   const emp = EMPLOYEES.find(function (e) { return e.employeeId === String(a.employeeId); }) ||
