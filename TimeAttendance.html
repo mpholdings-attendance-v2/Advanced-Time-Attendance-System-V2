@@ -1548,6 +1548,7 @@ function endSession(message) {
   clearInterval(idleTimer); idleTimer = null;
   stopAlertPolling(); clearInterval(dashTimer); clearInterval(dashTick);
   try { sessionStorage.removeItem('admin_session'); sessionStorage.removeItem('admin_last_activity'); } catch (e) {}
+  resetTimeCardsView(); // TCCLEAR: the next login starts with an empty Time Cards page
   closeAlertPopup();
   document.querySelectorAll('.dlg-overlay.open').forEach(function (o) { o.classList.remove('open'); });
   document.getElementById('idleWarn').classList.remove('open');
@@ -2195,6 +2196,23 @@ function restoreReportState(showSaved) {
 }
 function clearReportState() {
   try { sessionStorage.removeItem('admin_tc_state'); sessionStorage.removeItem('admin_tc_data'); } catch (e) {}
+}
+// TCCLEAR: logout / idle logout / expired session (endSession) — forget the saved Time Cards and empty
+// the Time Cards page (cards, choices, messages, Print). F5 during the same login still keeps them (R2).
+function resetTimeCardsView() {
+  clearReportState();
+  reportEmp = null;
+  const rs = document.getElementById('repSearch'); rs.value = ''; if (rs.pickerSync) rs.pickerSync();
+  repStart.value = ''; repEnd.value = '';
+  document.getElementById('reportOut').innerHTML = ''; clearMsg('repMsg');
+  document.getElementById('printBtn').disabled = true;
+  document.getElementById('tcPhotos').checked = false;
+  ARCH.current = null; ARCH.previewing = false;
+  arFind.value = ''; arEmp.innerHTML = ''; arPeriod.innerHTML = '';
+  document.getElementById('archOut').innerHTML = ''; clearMsg('arMsg');
+  document.getElementById('arPrint').disabled = true;
+  document.getElementById('arPhotos').checked = false;
+  tcView('live');
 }
 
 function renderTimecard(c, startDate, endDate) {
