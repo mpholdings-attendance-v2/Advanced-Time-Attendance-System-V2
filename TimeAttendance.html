@@ -79,6 +79,8 @@
   .msg:empty { display: none; }
   .msg.ok { background: #e6f4ea; color: #1e5e2c; }
   .msg.err { background: #fdecea; color: #8c1d18; }
+  .msg.info { background: #eef3fb; color: #1f4e9c; }
+  #reportOut.tc-loading { opacity: .45; pointer-events: none; } /* TCNEWEST: old cards while new ones load */
   .note { background: var(--warn-bg); color: var(--warn-ink); padding: 10px 14px; border-radius: 6px; margin-bottom: 18px; font-size: 13px; }
 
   /* ---- employee search ---- */
@@ -2139,6 +2141,20 @@ function setPeriod(offset) {
   if (typeof tcView === 'function' && tcMode !== 'live') tcView('live');
 }
 
+// TCNEWEST: every Time Cards request gets a number and only the NEWEST one may change the screen (an older answer
+// that arrives late is ignored). While it runs: old cards greyed out, Print and "Show time cards" off, Loading message.
+let REPORT_SEQ = 0;
+function setReportLoading(on) {
+  const out = document.getElementById('reportOut'), btn = document.querySelector('#livePanel .btn-primary');
+  out.classList.toggle('tc-loading', on);
+  btn.classList.toggle('loading', on); btn.disabled = on;
+  if (!on) return;
+  document.getElementById('printBtn').disabled = true;
+  const m = document.getElementById('repMsg');
+  if (/— updating…$/.test(m.textContent)) return; // saved cards just shown after F5: keep "Showing the time cards from …"
+  m.className = 'msg info';
+  m.textContent = out.children.length ? 'Loading time cards… (the cards below are from before and will be replaced)' : 'Loading time cards…';
+}
 async function loadReport() {
   if (!repStart.value || !repEnd.value) { setMsg('repMsg', false, 'Choose the dates first.'); return; }
   if (SERVER_PERIODS && repStart.value < SERVER_PERIODS.previous.start) { // ARCHIVE: live = Current + Previous only
@@ -2153,9 +2169,15 @@ async function loadReport() {
     }
     document.getElementById('repSearch').value = reportEmp.name + ' (' + reportEmp.employeeId + ')';
   }
-  const result = await call('timecardReport', {
-    startDate: repStart.value, endDate: repEnd.value, employeeId: reportEmp ? reportEmp.employeeId : ''
-  });
+  const seq = ++REPORT_SEQ;
+  setReportLoading(true);
+  let result;
+  try {
+    result = await call('timecardReport', {
+      startDate: repStart.value, endDate: repEnd.value, employeeId: reportEmp ? reportEmp.employeeId : ''
+    });
+  } finally { if (seq === REPORT_SEQ) setReportLoading(false); }
+  if (seq !== REPORT_SEQ) return; // TCNEWEST: a newer request (or a logout) replaced this one — change nothing
   const out = document.getElementById('reportOut'); out.innerHTML = '';
   if (!result.ok) { setMsg('repMsg', false, result.error.message); document.getElementById('printBtn').disabled = true; return; }
   const cards = result.data.cards;
@@ -2200,6 +2222,7 @@ function clearReportState() {
 // TCCLEAR: logout / idle logout / expired session (endSession) — forget the saved Time Cards and empty
 // the Time Cards page (cards, choices, messages, Print). F5 during the same login still keeps them (R2).
 function resetTimeCardsView() {
+  REPORT_SEQ++; setReportLoading(false); // TCNEWEST: an answer still on its way is ignored
   clearReportState();
   reportEmp = null;
   const rs = document.getElementById('repSearch'); rs.value = ''; if (rs.pickerSync) rs.pickerSync();
