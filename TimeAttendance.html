@@ -271,6 +271,10 @@
     .timecard th, .tlabel, .tc-corr h4, .tc-incomplete, .tc-totals th, .tc-totals tr.pp-total td { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
     .timecard tr.week-total td, .timecard tr.grand td { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
     @page { size: letter portrait; margin: 12mm; }
+    /* PRINT GUARD (from V1 A1): cards still being drawn are never printed (also Ctrl+P / browser menu) — only this notice */
+    #reportOut.tc-drawing > * { display: none !important; }
+    #reportOut.tc-drawing::before { content: 'Time cards are still loading. Wait until every card is shown, then print again.';
+      display: block; font-size: 16px; font-weight: 700; padding: 24px 0; }
   }
 
   /* ================= App layout with sidebar ================= */
@@ -1246,6 +1250,12 @@ function companyFor(c) {
 }
 
 let sessionToken = null;
+// SESSION GUARD (Codex review of V1 Phase 1): every login and every end of a session (logout, idle logout, expiry) gets a
+// new SESSION_GEN. A request remembers the number it was sent under; when its answer (or a retry) comes after the
+// session ended or changed, call() throws STALE_SESSION_ instead of answering, so the old session's work stops where it
+// is: nothing is shown, saved, marked seen or made printable, and an old AUTH_REQUIRED never ends a newer session.
+// (SESSION_GEN and STALE_SESSION_ are declared with call() below.)
+window.addEventListener('unhandledrejection', function (e) { if (e.reason === STALE_SESSION_) e.preventDefault(); });
 let bootData = null; // AUDIT2 A2: data from adminBootstrap, used once right after login
 let EMPLOYEES = [];      // [{employeeId, name, department, position, status}]
 let VENUES = [];         // [{venueId, venueName, status}]
@@ -1263,7 +1273,7 @@ function apiUrl() { return document.getElementById('apiUrl').value.replace(/\s+/
 async function run(btn, fn) {
   if (btn.classList.contains('loading')) return;
   btn.classList.add('loading'); btn.disabled = true;
-  try { await fn(); } catch (e) { console.error(e); }
+  try { await fn(); } catch (e) { if (e !== STALE_SESSION_) console.error(e); }
   finally { btn.classList.remove('loading'); btn.disabled = false; }
 }
 
@@ -1431,25 +1441,33 @@ function newRequestId() {
   return 'REQ-' + day + '-' + s;
 }
 
+let SESSION_GEN = 0; // SESSION GUARD (see sessionToken above)
+const STALE_SESSION_ = { staleSession: true, message: 'answer of an earlier session ignored' };
 // opts.bg = background refresh (auto-polling): does NOT count as activity (IDLE I2)
 async function call(action, payload, opts) {
   const url = apiUrl();
   if (!url) return { ok: false, error: { code: 'NO_URL', message: 'Set the Web App URL on the login screen first.' } };
-  const bg = !!(opts && opts.bg);
+  const bg = !!(opts && opts.bg), gen = SESSION_GEN; // SESSION GUARD: the session this request belongs to
+  const stale = function () { if (gen !== SESSION_GEN) throw STALE_SESSION_; };
   const body = Object.assign({}, payload || {}, { token: sessionToken });
   if (bg) body.bg = true; else lastServerTouch = Date.now();
   const idemp = IDEMP_OK && SAVE_ACTIONS.test(action);
   if (idemp) body.requestId = newRequestId(); // IDEMP: once per click — never a new one on retry
   let result = await postApi(url, action, body);
+  stale();
   if (!result.ok && result.error && RETRYABLE[result.error.code] && READ_ACTIONS.test(action)) {
     await new Promise(function (r) { setTimeout(r, 1500); });
+    stale(); // no retry for a session that ended meanwhile
     result = await postApi(url, action, body); // FIX14 #1: one automatic retry for reads
+    stale();
   }
   for (let i = 1; idemp && i <= 3 && !result.ok && result.error && SAVE_RETRY[result.error.code]; i++) {
     await new Promise(function (r) { setTimeout(r, 2000 * i); }); // IDEMP: 2 s, 4 s, 6 s
+    stale();
     result = await postApi(url, action, body); // the SAME body = the same request ID
+    stale();
   }
-  if (!result.ok && result.error && result.error.code === 'AUTH_REQUIRED') {
+  if (!result.ok && result.error && result.error.code === 'AUTH_REQUIRED') { // only the CURRENT session's (stale() above)
     endSession(result.error.message || 'Session expired. Please log in again.');
   }
   return result;
@@ -1550,7 +1568,7 @@ async function doLogin() {
     return;
   }
   try { localStorage.setItem('admin_apiUrl', url); } catch (e) {}
-  sessionToken = result.data.token;
+  sessionToken = result.data.token; SESSION_GEN++; // SESSION GUARD: a new session
   lastActivity = Date.now(); lastServerTouch = Date.now();
   try { sessionStorage.setItem('admin_last_activity', String(lastActivity)); } catch (e) {}
   // Keep the session through a page refresh (F5). sessionStorage is cleared
@@ -1563,6 +1581,8 @@ async function doLogin() {
 }
 
 async function enterApp() {
+  // SESSION GUARD: this start-up belongs to this session only (typeof: the start-up is also tested on its own, without call())
+  const gen = typeof SESSION_GEN === 'undefined' ? null : SESSION_GEN, mine = function () { return gen === null || gen === SESSION_GEN; };
   document.body.classList.add('in-app');
   let who = 'Admin';
   try { who = sessionStorage.getItem('admin_user') || 'Admin'; } catch (e) {}
@@ -1605,14 +1625,15 @@ async function enterApp() {
     }
     restoreClockEmployee();
   } catch (e) {
+    if (typeof STALE_SESSION_ !== 'undefined' && e === STALE_SESSION_) throw e; // the session ended meanwhile: stop quietly
     console.warn('[attendance] start-up problem', e);
     toast('Some data could not load. It will retry automatically.');
   } finally {
     // FIX14 #1: whatever happened above, the portal keeps working (refreshes, alerts, idle timer)
-    if (sessionToken) {
+    if (sessionToken && mine()) { // SESSION GUARD: never start polling / idle watch for a newer session
       startAlertPolling(bootData && bootData.alerts);
       startIdleWatch(bootData && bootData.idleMinutes);
-      if (!EMPLOYEES.length || !VENUES.length) setTimeout(function () { if (sessionToken) { loadEmployees(); loadVenues(); } }, 10000);
+      if (!EMPLOYEES.length || !VENUES.length) setTimeout(function () { if (sessionToken && mine()) { loadEmployees(); loadVenues(); } }, 10000);
     }
     bootData = null;
   }
@@ -1637,7 +1658,7 @@ async function doLogout() {
 let IDLE_MS = 30 * 60 * 1000;
 let lastActivity = Date.now(), lastServerTouch = Date.now(), idleTimer = null;
 function endSession(message) {
-  sessionToken = null;
+  sessionToken = null; SESSION_GEN++; // SESSION GUARD: answers of this session are ignored from now on
   clearInterval(idleTimer); idleTimer = null;
   stopAlertPolling(); clearInterval(dashTimer); clearInterval(dashTick);
   try { sessionStorage.removeItem('admin_session'); sessionStorage.removeItem('admin_last_activity'); } catch (e) {}
@@ -2418,7 +2439,8 @@ makePicker('repSearch', 'repSearchList', function (e) {
 }, function () {
   // × also clears the time cards shown below
   reportEmp = null; clearMsg('repMsg'); clearReportState();
-  document.getElementById('reportOut').innerHTML = '';
+  REPORT_SEQ++; setReportLoading(false); // V2 CLEAR: an older request or slice run must not bring cards back
+  document.getElementById('reportOut').innerHTML = ''; document.getElementById('reportOut').classList.remove('tc-drawing');
   document.getElementById('printBtn').disabled = true;
 });
 document.getElementById('repSearch').addEventListener('input', function () { reportEmp = null; });
@@ -2466,7 +2488,7 @@ async function loadReport() {
     });
   } finally { if (seq === REPORT_SEQ) setReportLoading(false); }
   if (seq !== REPORT_SEQ) return; // TCNEWEST: a newer request (or a logout) replaced this one — change nothing
-  const out = document.getElementById('reportOut'); out.innerHTML = '';
+  const out = document.getElementById('reportOut'); out.innerHTML = ''; out.classList.remove('tc-drawing'); // PRINT GUARD
   if (!result.ok) { setMsg('repMsg', false, result.error.message); document.getElementById('printBtn').disabled = true; return; }
   const cards = result.data.cards;
   if (!cards.length) { setMsg('repMsg', false, 'No punches in this period.'); document.getElementById('printBtn').disabled = true; return; }
@@ -2482,14 +2504,17 @@ async function loadReport() {
 // A1: many cards are drawn TC_SLICE at a time so the page stays responsive; Print comes on after the last slice.
 // A newer request (REPORT_SEQ) stops an older run. A short list is drawn at once, exactly as before.
 const TC_SLICE = 40;
+// PRINT GUARD (from V1 A1): while slices are still being drawn #reportOut has the class tc-drawing, so printing shows only
+// "still loading" (see @media print). It is removed after the last slice, or by whoever stops the run and clears the cards.
 function renderCards_(out, data, seq, done) {
   let i = 0;
+  out.classList.add('tc-drawing');
   (function slice() {
-    if (seq !== REPORT_SEQ) return;
+    if (seq !== REPORT_SEQ) return; // stopped: whoever replaced this run clears the cards (and tc-drawing)
     const frag = document.createDocumentFragment();
     for (const end = Math.min(i + TC_SLICE, data.cards.length); i < end; i++) frag.appendChild(renderTimecard(data.cards[i], data.startDate, data.endDate));
     out.appendChild(frag);
-    if (i < data.cards.length) setTimeout(slice, 0); else done();
+    if (i < data.cards.length) setTimeout(slice, 0); else { out.classList.remove('tc-drawing'); done(); }
   })();
 }
 
@@ -2511,7 +2536,8 @@ function restoreReportState(showSaved) {
   if (document.getElementById('repSearch').pickerSync) document.getElementById('repSearch').pickerSync();
   reportEmp = st.empId ? (EMPLOYEES.find(function (e) { return e.employeeId === st.empId; }) || { employeeId: st.empId, name: st.empLabel }) : null;
   if (showSaved && data && data.cards) {
-    const out = document.getElementById('reportOut'); out.innerHTML = '';
+    REPORT_SEQ++; setReportLoading(false); // V2 CLEAR: an older request or slice run must not append to the saved cards
+    const out = document.getElementById('reportOut'); out.innerHTML = ''; out.classList.remove('tc-drawing');
     data.cards.forEach(function (c) { out.appendChild(renderTimecard(c, data.startDate, data.endDate)); });
     document.getElementById('printBtn').disabled = !data.cards.length;
     setMsg('repMsg', true, 'Showing the time cards from ' + new Date(st.at).toLocaleTimeString('en-US', { timeZone: TZ, hour: 'numeric', minute: '2-digit' }) + ' — updating…');
@@ -2529,7 +2555,7 @@ function resetTimeCardsView() {
   reportEmp = null;
   const rs = document.getElementById('repSearch'); rs.value = ''; if (rs.pickerSync) rs.pickerSync();
   repStart.value = ''; repEnd.value = '';
-  document.getElementById('reportOut').innerHTML = ''; clearMsg('repMsg');
+  document.getElementById('reportOut').innerHTML = ''; document.getElementById('reportOut').classList.remove('tc-drawing'); clearMsg('repMsg');
   document.getElementById('printBtn').disabled = true;
   document.getElementById('tcPhotos').checked = false;
   ARCH.current = null; ARCH.previewing = false;
@@ -2838,6 +2864,7 @@ async function voidPaidBatch(btn, batchId, list) {
 }
 // R5: confirm before printing incomplete time cards
 function printTimecards() {
+  if (document.getElementById('reportOut').classList.contains('tc-drawing')) return; // PRINT GUARD: not every card is drawn yet
   const bad = document.querySelectorAll('#reports .tc-incomplete').length;
   if (bad && !confirm(bad + ' time card(s) are INCOMPLETE (missing clock-in / clock-out or still clocked in).\nThe warning will be printed on those cards. Print anyway?')) return;
   fitPrintPages();
@@ -4469,7 +4496,7 @@ async function removeKiosk(btn, t) {
   let saved = null;
   try { saved = sessionStorage.getItem('admin_session'); } catch (e) {}
   if (!saved || !apiUrl()) return;
-  sessionToken = saved;
+  sessionToken = saved; SESSION_GEN++; // SESSION GUARD
   enterApp();
   // After a refresh the browser blocks sound until the first click; unlock it then.
   document.addEventListener('click', function unlock() {
